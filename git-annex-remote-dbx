@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+
+import sys
+import functools
+import webbrowser
+import http.server
+import urllib.parse
+import contextlib
+
+import humanfriendly
+
+import annexremote
+
+import dropbox
+
+app_key = 'ivz4pf7ieblbkn9'
+app_secret = 'snes1hn5pjhstjf'
+
+def convert_to_remote_error(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwds):
+        try:
+            ret = f(*args, **kwds)
+        except annexremote.RemoteError:
+            raise
+        except Exception as e:
+            raise annexremote.RemoteError(e)
+        return ret
+    return wrapper
+
+class _DropboxAuthResponseHandler(http.server.BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        try:
+            self._do_GET()
+        except Exception as e:
+            self.server.annex.debug(str(e))
+
+    def _do_GET(self):
+        res = urllib.parse.urlsplit(self.path)
+        if res.path != self.server.expected_path:
+            self.send_error(404)
+            return
+        query = dict(urllib.parse.parse_qsl(res.query))
+        try:
+            oauth_res = self.server.oauth_helper.finish(query)
+        except dropbox.oauth.NotApprovedException:
+            body = 'git-annex has not been authorized to access your Dropbox :('
+        except dropbox.exceptions.Exception as e:
+            body = 'Something went wrong: {}'.format(e)
+        else:
+            body = 'git-annex has been authorized to access your Dropbox!'
+            self.server.annex.setcreds('token', 'dbx', oauth_res.access_token)
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.send_header('Content-Length', len(body))
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def log_message(self, format, *args):
+        self.server.annex.debug(format % args)
+
+class DropboxRemote(annexremote.SpecialRemote):
+
+    @convert_to_remote_error
+    def initremote(self):
+        token = self.annex.getcreds('token')['password']
+        if not token:
+            self._get_and_save_access_token()
+        upload_chunk_size = self.annex.getconfig('upload_chunk_size')
+        if upload_chunk_size:
+            try:
+                humanfriendly.parse_size(upload_chunk_size)
+            except humanfriendly.InvalidSize:
+                raise annexremote.RemoteError(
+                    'incorrect value for upload_chunk_size'
+                )
+
+    @convert_to_remote_error
+    def prepare(self):
+        token = self.annex.getcreds('token')['password']
+        self._dbx = dropbox.Dropbox(token, timeout=None)
+        self._prefix = self.annex.getconfig('prefix')
+        if not self._prefix:
+            self._prefix = 'git-annex'
+        default_upload_chunk_size = 1024**2 # 1Mib
+        upload_chunk_size = self.annex.getconfig('upload_chunk_size')
+        if not upload_chunk_size:
+            self._upload_chunk_size = default_upload_chunk_size
+        else:
+            self._upload_chunk_size = humanfriendly.parse_size(upload_chunk_size)
+
+    @convert_to_remote_error
+    def checkpresent(self, key):
+        fname = self._get_file_name(key)
+        try:
+            self._dbx.files_get_metadata(fname)
+        except dropbox.exceptions.ApiError as e:
+            if e.error.is_path():
+                lookup_error = e.error.get_path()
+                if lookup_error.is_not_found():
+                    return False
+            raise
+        return True
+
+    @convert_to_remote_error
+    def transfer_store(self, key, local_file):
+        if self.checkpresent(key):
+            return
+        remote_file = self._get_file_name(key)
+        chunks = self._get_chunks(local_file, self._upload_chunk_size)
+        is_last_chunk, chunk = next(chunks)
+        session_id = self._dbx.files_upload_session_start(chunk).session_id
+        cursor = dropbox.files.UploadSessionCursor(session_id, len(chunk))
+        self.annex.progress(cursor.offset)
+        if is_last_chunk:
+            chunk = b''
+        else:
+            for is_last_chunk, chunk in chunks:
+                if is_last_chunk:
+                    # The last chunk will be sent when finishing the
+                    # session
+                    break
+                self._dbx.files_upload_session_append_v2(chunk, cursor)
+                cursor.offset += len(chunk)
+                self.annex.progress(cursor.offset)
+        commit_info = dropbox.files.CommitInfo(remote_file)
+        self._dbx.files_upload_session_finish(chunk, cursor, commit_info)
+        if chunk:
+            self.annex.progress(cursor.offset + len(chunk))
+
+    @convert_to_remote_error
+    def transfer_retrieve(self, key, local_file):
+        remote_file = self._get_file_name(key)
+        metadata, resp = self._dbx.files_download(remote_file)
+        offset = 0
+        with contextlib.closing(resp), open(local_file, 'wb') as f:
+            for chunk in resp.iter_content(1024**2):
+                f.write(chunk)
+                offset += len(chunk)
+                self.annex.progress(offset)
+
+    @convert_to_remote_error
+    def remove(self, key):
+        remote_file = self._get_file_name(key)
+        try:
+            self._dbx.files_delete(remote_file)
+        except dropbox.exceptions.ApiError as e:
+            if e.error.is_path_lookup():
+                lookup_error = e.error.get_path_lookup()
+                if lookup_error.is_not_found():
+                    return
+            raise
+
+    def _get_file_name(self, key):
+        dir_ = self.annex.dirhash_lower(key)
+        return '/{}/{}{}'.format(self._prefix, dir_, key)
+
+    def _get_chunks(self, local_file, chunk_size=4096):
+        with open(local_file, 'rb') as f:
+            chunk = b''
+            remaining_len = chunk_size
+            complete_chunk = False
+            while True:
+                data = f.read(remaining_len)
+                if not data:
+                    yield True, chunk
+                    break
+                if complete_chunk:
+                    yield False, chunk
+                    chunk = b''
+                    complete_chunk = False
+                chunk += data
+                current_len = len(chunk)
+                if current_len < chunk_size:
+                    remaining_len -= current_len
+                else:
+                    remaining_len = chunk_size
+                    complete_chunk = True
+
+    def _get_and_save_access_token(self):
+        server_addr = ('127.0.0.1', 12345)
+        path = '/dropbox-auth-finish'
+        redirect_uri = 'http://{}:{}{}'.format(*server_addr, path)
+        oauth_helper = dropbox.oauth.DropboxOAuth2Flow(
+            app_key, app_secret, redirect_uri, {}, 'csrf_token_session_key'
+        )
+        server = http.server.HTTPServer(server_addr, _DropboxAuthResponseHandler)
+        server.timeout = 60
+        server.annex = self.annex
+        server.oauth_helper = oauth_helper
+        server.expected_path = path
+        try:
+            webbrowser.open(oauth_helper.start())
+            server.handle_request()
+            token = self.annex.getcreds('token')['password']
+            if not token:
+                raise annexremote.RemoteError('failed to get access token')
+        finally:
+            server.server_close()
+
+def main():
+    master = annexremote.Master()
+    remote = DropboxRemote(master)
+    master.LinkRemote(remote)
+    master.Listen()
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())
