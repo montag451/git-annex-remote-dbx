@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='git-annex-remote-dbx',
-    version='1.0.1',
+    version='1.0.2',
     author_email='montag451@laposte.net',
     maintainer='montag451',
     maintainer_email='montag451@laposte.net',
