@@ -191,7 +191,8 @@ class DropboxRemote(annexremote.SpecialRemote):
         server.oauth_helper = oauth_helper
         server.expected_path = path
         try:
-            webbrowser.open(oauth_helper.start())
+            if not webbrowser.open(oauth_helper.start()):
+                raise annexremote.RemoteError('no web browser available')
             server.handle_request()
             token = self.annex.getcreds('token')['password']
             if not token:
