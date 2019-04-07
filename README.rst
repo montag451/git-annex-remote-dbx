@@ -18,9 +18,9 @@ used which is bad):
 
    git annex initremote myremote type=external externaltype=dbx encryption=none prefix=git-annex upload_chunk_size=10MiB
 
-To access your Dropbox, this special remote need an access token. When
-creating the special remote, a browser tab will be opened for you to
-connect to your Dropbox and to grant access for it to this
+To access your Dropbox, this special remote needs an access
+token. When creating the special remote, a browser tab will be opened
+for you to connect to your Dropbox and to grant access to this
 application.
 
 This special remote accepts several parameters:
